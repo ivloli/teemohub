@@ -1,0 +1,11 @@
+.env
+apikey
+runtime/
+logs/
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+*.log
+.DS_Store
+.qoder/
+__pycache__/
