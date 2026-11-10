@@ -8,12 +8,21 @@ import (
 	"unicode/utf8"
 )
 
-// Counter is deliberately an interface: P0 ships a deterministic heuristic,
-// and an exact HF-tokenizers implementation can be swapped in per model
-// without touching the billing pipeline.
+// Tokenizer is the swap point for exact tokenizers: P0 ships the deterministic
+// heuristic below, and a Rust-backed implementation can satisfy the same
+// interface without touching the billing pipeline.
+type Tokenizer interface {
+	CountText(s string) int64
+	CountMessages(messages []json.RawMessage, tools json.RawMessage) int64
+	CountOutput(content, reasoning string, tools []ToolText) int64
+}
+
+// Counter is the P0 heuristic implementation of Tokenizer.
 type Counter struct {
 	Family string
 }
+
+var _ Tokenizer = Counter{}
 
 func (c Counter) CountText(s string) int64 {
 	if s == "" {

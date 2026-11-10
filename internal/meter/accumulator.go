@@ -44,7 +44,7 @@ type Result struct {
 
 type Accumulator struct {
 	mu        sync.Mutex
-	counter   Counter
+	counter   Tokenizer
 	localIn   int64
 	maxOut    int64
 	seq       int64
@@ -64,7 +64,7 @@ type Accumulator struct {
 	lastAt    time.Time
 }
 
-func NewAccumulator(counter Counter, localInput, maxOut int64) *Accumulator {
+func NewAccumulator(counter Tokenizer, localInput, maxOut int64) *Accumulator {
 	now := time.Now()
 	return &Accumulator{
 		counter:   counter,

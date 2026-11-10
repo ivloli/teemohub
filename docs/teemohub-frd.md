@@ -1,6 +1,6 @@
 # teemoHub 功能需求文档（FRD）
 
-**版本**：v0.7（2026-10-30）
+**版本**：v0.10（2026-11-10）
 **定位**：本地可运行的 AI 网关与计量计费系统，对标 Token Rhythm 的产品形态
 **上游**：现有 New API（不改源码）+ Kimi / DeepSeek
 **关联文档**：`/Users/chuanhe/rea-scan/ai-gateway-rebuild-design.md`（架构与计费设计，以下简称“主设计”）
@@ -11,7 +11,7 @@
 
 1. **目标**：在本机跑通“登录 → 创建 Key → 网关 → New API → Kimi/DeepSeek → 计量计费 → 前端看账”的完整闭环，并复现主设计里的断流计费逻辑。
 2. **边界**：New API 保持不动，只作为上游执行器；teemoHub 自建控制面、数据面、计量与账本；Provider Key 只存在 New API。
-3. **语言选型**：控制面、网关、计量全部 **Go**；只有 tokenizer 内核用 **Rust**（HF `tokenizers` crate，经 cgo 绑定或独立 UDS sidecar）。不把数据面改成 Rust。
+3. **语言选型**：控制面、网关、计量全部 **Go**；只有 tokenizer 内核计划用 **Rust**（HF `tokenizers` crate；默认经同节点 UDS sidecar 接入，保持 Go 侧 `CGO_ENABLED=0`，cgo 绑定仅作可选构建）。**当前代码尚未接入 Rust**，仍是 Go 启发式估算（见 5.1、5.5、13.4）。不把数据面改成 Rust。
 4. **计费优先级**：`provider_final > provider_partial > counted_text > estimate_text > estimate_prompt_only > none`；Mode A 下必须再标 `usage_trust`，因为 New API 可能自算 usage。
 5. **断流**：上游请求使用 detached context；客户端断开只停写客户端，上游按六维 drain 预算继续读；拿不到 usage 时用“最后快照锚定 + 尾部增量 × 校准系数”。
 6. **账本**：金额一律 nanoCNY int64；预扣 `reserve` → 结算 `settle` → 释放 `release`；修正只追加 `adjustment`；事件幂等键 `(request_id, attempt, stream_seq)`。
@@ -191,11 +191,13 @@ sequenceDiagram
 | Control Plane | Go | 与 New API 同栈，DTO/协议复用成本低；CRUD 与并发模型简单 |
 | Gateway | Go | SSE 转发、`context.WithoutCancel`、连接池、超时控制成熟；I/O 密集，Rust 无显著收益 |
 | Accumulator / Rating / Ledger | Go | 逻辑确定、可测试；int64 计算；与事件管道同进程 |
-| Tokenizer 内核 | Rust | HuggingFace `tokenizers` 是事实标准；DeepSeek/Kimi 的 `tokenizer.json` 需要精确 BPE 实现；Go 原生移植滞后 |
-| Tokenizer 接入 | Go ↔ Rust | P0 用 `github.com/daulet/tokenizers`（cgo 绑定 Rust crate）；若 cgo 构建受阻，退化为同节点 Rust UDS sidecar |
+| Tokenizer 内核 | Rust（待接入） | HuggingFace `tokenizers` 是事实标准；DeepSeek 的自定义 BPE 需要精确实现；Go 原生移植滞后。Kimi 的制品格式需按账号实际发布确认（HF `tokenizer.json` 或 tiktoken BPE） |
+| Tokenizer 接入 | Go ↔ Rust | 默认同节点 UDS sidecar，保持 `CGO_ENABLED=0` 与 `modernc.org/sqlite` 的纯 Go 构建；`github.com/daulet/tokenizers`（cgo）仅作 `-tags tokenizers_cgo` 可选构建，不进入默认 `make build` |
 | Web | TypeScript + React + Vite | 前端迭代快；SSE 与中断用原生 `fetch`/`AbortController` |
 | DB | SQLite（WAL） | 单机零运维；P1 换 PostgreSQL |
 | 上游 | New API（Go） | 保持不动，复用渠道/协议/密钥管理 |
+
+> **现状（2026-11-10）**：`internal/meter/tokenizer.go` 仍是启发式计数，控制台 API 返回 `tokenizer=heuristic-calibrated`；Rust 内核尚未接入。5.4/5.5 是接入约定，不代表已完成能力。
 
 ### 5.2 为什么不全 Rust
 
@@ -206,19 +208,30 @@ sequenceDiagram
 
 ### 5.3 为什么不全 Go
 
-- DeepSeek/Kimi 的 tokenizer 是自定义 BPE；用 `tiktoken` 近似会在断流兜底时产生系统性偏差。
-- `tokenizers` crate 能直接加载官方 `tokenizer.json`，与 Provider 的 encode 结果对齐；这是校准金标的基础。
+- DeepSeek 使用自定义 BPE；Kimi/Moonshot 的制品格式以账号实际发布为准（HF `tokenizer.json` 或 tiktoken BPE），不能默认两者同构。用错误的 tokenizer 近似会在断流兜底时产生系统性偏差。
+- 能拿到官方制品时，`tokenizers` crate（HF `tokenizer.json`）或 `tiktoken-rs`（BPE）可复现 Provider 的 encode 结果，这是校准金标的基础；精确计数生效时必须关闭该请求的 EMA 校准（k=1），否则会双重修正。
 
 ### 5.4 Tokenizer 制品策略
 
 | 模型族 | 制品 | 加载方式 |
 |---|---|---|
-| DeepSeek | 官方 `tokenizer.json`（本地文件，SHA-256 固定） | 进程内热加载 |
-| Kimi / Moonshot | 官方 `tokenizer.json`（本地文件，SHA-256 固定） | 进程内热加载 |
+| DeepSeek | 官方 `tokenizer.json`（本地文件，SHA-256 固定） | 启动加载，按 model_family×version 缓存 |
+| Kimi / Moonshot | 官方制品（HF `tokenizer.json` 或 tiktoken BPE，按账号实际发布确认；SHA-256 固定） | 按格式选择 `tokenizers` / `tiktoken-rs` 后端 |
 | 其他 OpenAI 兼容 | `tiktoken` 编码（cl100k/o200k） | 进程内 |
 | 长尾/大词表 | 同节点 Rust sidecar（UDS） | 受限并发，不出节点 |
 
-启动时校验 SHA-256；缺失时降级为 `estimate_chars`，事件标 `tokenizer_id=estimate`，禁止把该样本当作校准金标。
+启动时校验 SHA-256 与制品许可；缺失、哈希不符、格式不支持或 sidecar 不可用时降级为 `estimate_chars`，事件标 `tokenizer_id=estimate` 并记录 `fallback_reason`，禁止把该样本当作校准金标。运行时只读本地制品，不联网下载。
+
+### 5.5 Rust 接入约定与验收（2026-11-10）
+
+当前尚未接入 Rust；落地时按以下约定执行，避免“先上 cgo 再回退”的返工：
+
+1. **交付形态**：默认同节点 UDS sidecar，Go 侧保持 `CGO_ENABLED=0`；cgo 绑定只在显式 `-tags tokenizers_cgo` 下编译，不进入 `make build` 与默认发布物。
+2. **进程契约**：UDS 路径、模型族→制品映射、请求/响应 JSON schema 固定并版本化；启动探活、最大并发、单请求超时、最大输入字节数可配置；sidecar 崩溃由进程管理器拉起，拉起期间网关降级 estimate，不阻塞请求。
+3. **失败语义**：超时、崩溃、SHA 不匹配、模型无制品 → `usage_source=estimate_text` / `tokenizer_id=estimate`，请求照常返回；所有降级样本排除在校准池外，并在 `/healthz` 的 `checks[]` 暴露 sidecar 与制品状态。
+4. **版本固定**：`rust-toolchain.toml` 固定 1.99.x；`tokenizers` / `tiktoken-rs` 使用精确版本与显式 features（regex 后端变化会改变切分结果）；制品记录 SHA-256、来源与许可，升级必须跑金标回归。
+5. **金标回归**：每个模型族保留 20–50 条 `provider_final` 样本（中英混排、工具调用、长 prompt），要求本地 encode 计数与 Provider 终态 usage 一致；不一致先查制品版本，再查 chat template 的 envelope 开销。
+6. **验收基线**：sidecar 冷启动 < 2s；8k token 计数 p99 < 20ms；故障注入下网关可用性不受影响且降级可对账；精确计数请求的 `calibration_id` 为空（k=1）。数值按本机实测校准后再固化。
 
 ---
 
@@ -246,6 +259,7 @@ sequenceDiagram
 | FR-KEY-003 | 吊销、启用/禁用、备注、过期时间 | P0 | 吊销后 401 |
 | FR-KEY-004 | Key 级配额：RPM、TPM（60s 滑动窗口）、并发、`max_output` | P1 | 超限 429 + `Retry-After` |
 | FR-KEY-005 | Key 绑定租户与默认模型白名单 | P0 | 越权模型 403 |
+| FR-KEY-006 | 创建 Key 时从管理侧预置的“使用范围”下拉选择（模型白名单 + 计费倍率），列表展示范围与倍率 | P1 | 范围外模型 403 `model_not_allowed`；停用范围 403 `key_scope_disabled`；倍率仅作用于客户侧费用 |
 
 ### 6.3 模型目录与路由
 
@@ -369,10 +383,11 @@ sequenceDiagram
 | `users` | id, username, password_hash, role, tenant_id, status, created_at | 账号 |
 | `sessions` | id, user_id, token_hash, expires_at, created_at | 会话 |
 | `tenants` | id, name, balance_nano, drain_policy_json | 租户与余额 |
-| `api_keys` | id, tenant_id, user_id, key_hash, prefix, last4, status, expires_at | API Key |
+| `api_keys` | id, tenant_id, user_id, key_hash, prefix, last4, status, expires_at, scope_id | API Key（`scope_id=0` 表示不限模型、1.0×） |
+| `key_scopes` | id, name, description, models, multiplier_bp, enabled, created_at | 管理侧预置的使用范围：模型白名单（空=全部已启用）+ 计费倍率（基点，10000=1.0×） |
 | `models` | id, alias, upstream_model, provider, price_json, tokenizer_id, caps_json, status | 模型目录 |
 | `channels_meta` | id, name, provider, usage_trust, newapi_channel_id, status | 渠道元数据 |
-| `requests` | request_id, trace_id, tenant_id, key_id, model, stream, status, started_at, ended_at, ttft_ms, end_reason | 请求主记录 |
+| `requests` | request_id, trace_id, tenant_id, key_id, model, stream, status, started_at, ended_at, ttft_ms, end_reason, scope_id, multiplier_bp | 请求主记录（准入时快照 Key 的范围与倍率） |
 | `usage_events` | event_id, request_id, attempt, stream_seq, terminal, usage_json, usage_source, usage_trust, local_tokens, billed_tokens, provider_tokens, tokenizer_id, calibration_id, price_version, cost_customer_nano, cost_provider_nano, drain_json, text_sha256 | 计量事件 |
 | `ledger_entries` | id, request_id, attempt, type, amount_nano, balance_after, created_at | 双分录流水 |
 | `outbox` | id, event_id, payload, status, retries, next_at | 异步投递 |
@@ -398,8 +413,11 @@ sequenceDiagram
 | POST | `/api/auth/login` | 用户名密码登录，设置 Cookie |
 | POST | `/api/auth/logout` | 登出 |
 | GET | `/api/me` | 当前用户与租户 |
-| GET/POST | `/api/keys` | 列出/创建 API Key |
+| GET/POST | `/api/keys` | 列出/创建 API Key（创建可带 `scope_id`） |
 | DELETE | `/api/keys/:id` | 吊销 |
+| GET | `/api/key-scopes` | 当前用户可选的使用范围（仅启用的） |
+| GET/POST | `/api/admin/key-scopes` | 管理侧列出/创建使用范围 |
+| PUT/DELETE | `/api/admin/key-scopes/:id` | 更新/删除使用范围（被 Key 引用时 409） |
 | GET | `/api/models` | 可用模型与价格 |
 | GET | `/api/usage/summary` | 今日/本月用量与费用 |
 | GET | `/api/usage/requests` | 请求日志分页/筛选 |
@@ -677,7 +695,7 @@ make e2e                      # 真实上游端到端测试
 
 | 项目 | FRD 早期设想 | 当前实现 |
 |---|---|---|
-| Tokenizer | Rust + 官方 `tokenizer.json` | Go 启发式（CJK 1 字/token、ASCII 4 字符/token、每消息 +4、总计 +3），按 `provider_final` 样本做 EMA 校准（k∈[0.7,1.8]） |
+| Tokenizer | Rust + 官方制品（尚未接入） | Go 启发式（CJK 1 字/token、ASCII 4 字符/token、每消息 +4、总计 +3），按 `provider_final` 样本做 EMA 校准（k∈[0.7,1.8]）；API 返回 `heuristic-calibrated`，接入约定见 5.5 |
 | 输入校准 | 全量参与 | 仅无 `tools` 且本地 ≥40 token 的样本参与；工具 schema 的 provider 口径显著偏高，会污染 kIn |
 | 输出校准 | 全量参与 | 仅本地 output ≥40 token 的样本参与，避免短样本被模板开销放大 |
 | New API 价格 | 每模型配置倍率 | 启用 `SelfUseModeEnabled`，跳过 New API 模型价格表，避免未配置价格导致 `model_price_error` |
@@ -835,6 +853,21 @@ Kimi（`kimi-k3.1-pro`，5 条）：
 7. **验证工具（`make audit` → `scripts/audit.py`，15/15）**：断言每个模型都有价格版本；改价追加新版本且旧版本内容不变；审计事件含 before/after 与版本号；`key.create` 审计含配额且不含密钥材料；发出的请求快照改价后的版本，恢复价格后该请求仍指向原版本；撤销审计存在；`before_id` 分页递减；四条篡改 SQL（两表 UPDATE/DELETE）全部被触发器拒绝且数据未变。
 8. **本轮回归（2026-10-30）**：`make e2e` 23/23、`make limits` 9/9、`make persist` 8/8、`make audit` 15/15；`npm run build` 通过。控制台改动经 TypeScript 构建校验；浏览器逐页点验因 Browser MCP 暂停而未在本轮执行，接口级断言覆盖了后端行为。
 
+#### 13.10 上游令牌模型白名单与控制台错误态接线（2026-11-02，v0.8）
+
+1. **上游 Token 限定模型范围**：New API 的令牌支持 `model_limits_enabled` + `model_limits`；`scripts/bootstrap-newapi.sh` 现在把 `teemohub-gateway` 令牌限定为 teemoHub 实际转发的三个上游模型（`DEEPSEEK_MODEL`、`DEEPSEEK_REASONER_MODEL`、`KIMI_MODEL`），每次运行幂等回写。线上令牌已按同一逻辑生效并实测：`GET /v1/models` 只返回这 3 个 id；用该令牌直接请求 `gpt-4o-mini` 返回 403 `This token has no access to model ...`；经 teemoHub 网关的正常请求仍 200（`scope-ok`），且网关自身对未知模型先返回 400 `unknown model`。作用：即使 `.env` 中的上游令牌泄露，也无法借 New API 调用白名单外的模型/渠道；供应商范围由各渠道的模型列表与令牌白名单共同约束（令牌本身不直接绑定渠道）。`KIMI_MODEL` 的脚本默认值同步为 `kimi-k3.1-pro`，与 teemoHub 配置默认值一致。
+2. **列表页错误态接线**：此前 `PageState` 的 error/onRetry 分支只在请求详情使用，列表页接口失败时会误显示“空数据”。现请求日志、模型目录、Keys、管理台用户/模型定价/审计页在无数据时传入 error 与重试回调；已有数据时保留旧列表并在上方提示错误（刷新失败不清空视图）。浏览器实测：停服后进入请求日志显示 `Failed to fetch` + “重试”，恢复服务点重试即回到 130 条列表。
+
+#### 13.11 使用范围密钥与计费倍率（2026-11-02，v0.9）
+
+1. **数据与语义**：新增 `key_scopes`（`name` 唯一、`description`、逗号分隔 `models`、`multiplier_bp`、`enabled`），`api_keys.scope_id` 关联；`models` 为空表示“全部已启用模型”。倍率以基点存储（10000=1.0×），管理侧校验区间 1000–100000（0.1×–10×），默认 10000。`scope_id=0` 等价于不限模型、1.0×。
+2. **管理侧配置**：运营管理新增“使用范围”页签，可增删改范围、勾选可用模型（模型目录中的已启用模型）、填写倍率与启用开关；删除按钮在 `key_count>0` 时禁用（服务端同样返回 409“scope is still assigned to API keys”），需要停用时改用禁用，用户下拉中随即消失。变更写入审计（资源 `key_scope`，动作 `key_scope.create/update/delete`）。
+3. **用户侧选择**：Keys 页新建表单的“使用范围”下拉只列出已启用范围，选中后展示说明、可用模型与倍率提示；密钥列表行展示范围徽标与倍率。创建成功后仍只展示一次明文。
+4. **网关强制**：准入时按 Key 的 `scope_id` 加载范围快照——范围不存在返回 403 `key_scope_unavailable`，被禁用返回 403 `key_scope_disabled`，模型不在白名单返回 403 `model_not_allowed`；模型为空时放行全部已启用模型。`GET /v1/models` 按该 Key 的白名单过滤，价格按倍率折算并带 `multiplier` 字段，便于客户端预判费用。
+5. **倍率只作用于客户侧**：预留额度按 `(v*bp+9999)/10000` 向上取整，结算客户费用按 `(v*bp+5000)/10000` 四舍五入（`internal/meter/rating.go:ApplyMultiplier`），上游成本 `cost_provider_nano` 与毛利口径不变；`requests` 在准入时快照 `scope_id`/`multiplier_bp`，事后调整范围倍率不影响历史请求与账本。
+6. **确认弹窗**：用户侧“创建密钥/撤销密钥”，管理侧“保存使用范围（新建或更新）/删除使用范围”均走 `ConfirmDialog`（撤销与删除为 danger 样式，提交中禁用重复点击）。用户侧删除范围按钮被引用时直接禁用并给出 title 提示，避免先点再报错。
+7. **本轮回归**：`npm run build` 通过、`go test ./...` 通过、`make audit` 15/15、`make e2e` 23/23（首轮 23/23 中出现一次断流输出 token 单调性抖动，属上游内容抖动，重跑通过）；浏览器逐项实测管理侧范围增删改、用户侧下拉过滤、范围外模型 403、倍率折算后的 `/v1/models` 价格、创建/撤销/保存/删除确认弹窗与审计记录。
+
 ---
 
 ## 14. 里程碑
@@ -846,7 +879,7 @@ Kimi（`kimi-k3.1-pro`，5 条）：
 | M2 | Control：登录、Key、余额、模型、日志 API | 1–2 天 |
 | M3 | Gateway：转发、SSE、detached context、drain | 2–3 天 |
 | M4 | Metering：Accumulator、快照锚定、计费、账本、幂等 | 1–2 天 |
-| M5 | Tokenizer：DeepSeek/Kimi 制品、Rust 绑定、校准 | 1–2 天 |
+| M5 | Tokenizer：DeepSeek/Kimi 制品、Rust sidecar、校准（未开始） | 2–3 天 |
 | M6 | 前端：登录/概览/Key/Playground/日志/管理 | 2 天 |
 | M7 | E2E 与报告 | 1 天 |
 
@@ -861,8 +894,9 @@ Kimi（`kimi-k3.1-pro`，5 条）：
 | New API 初始化/登录有 2FA 或安全校验 | bootstrap 失败 | 脚本检测 challenge；必要时用环境变量关闭安全校验（仅本地） |
 | New API 自算 usage | 误当金标 | `usage_trust`；契约测试；shadow 对比；高价值走 Mode B |
 | Provider 断流行为不同 | usage 拿不到 | detached context + drain；快照锚定 + 校准 |
-| Kimi/DeepSeek tokenizer 制品不可得 | 计数偏差 | 本地文件 + SHA-256；缺失时降级并告警 |
-| cgo 构建 Rust tokenizers 失败 | 无法精确计数 | 退化同节点 Rust UDS sidecar |
+| Kimi/DeepSeek tokenizer 制品不可得或格式不符 | 计数偏差 | 本地文件 + SHA-256；按制品格式选择 tokenizers/tiktoken-rs；缺失时降级并告警 |
+| Rust sidecar 崩溃/超时 | 精确计数不可用 | 请求级降级 estimate + `fallback_reason`；进程守护与 `/healthz` 检查；降级样本不计入校准 |
+| Rust crate/工具链版本漂移 | 与 Provider 计数不一致 | `rust-toolchain.toml` 与 crate 精确锁版本；每模型金标回归 |
 | SSE 被中间层缓冲 | 前端不流式 | 禁用缓冲、逐 chunk flush、CORS/代理配置 |
 | SQLite 并发写 | 锁等待 | WAL + 单写队列 + busy_timeout |
 | Key 泄漏 | 额度损失 | 不入库明文、不日志、0600、仅本地 |
@@ -885,7 +919,7 @@ P0 全部满足：
 9. 数据库无 prompt/completion 正文与 Provider Key 明文。
 10. 至少一份 E2E 报告，列出每组断流的 usage 可得性、来源、token、费用与偏差。
 
-验收状态（2026-10-29）：第 1–7、9、10 项已实测通过（见 13.4）；第 8 项仅验证了 `:18080` 控制面存活，未逐项断言 DB/New API/tokenizer 子状态；第 6 项的“重放不重复入账”由唯一键与 `ON CONFLICT DO NOTHING` 保证，但当时未做主动重放测试（v0.6 已补齐，见 13.8）。新增第 11 项“三方对账”已完成（见 13.5）：请求数、完成态 token、Kimi 逐条均与 Provider 一致，仅断流请求存在约 +17% 的输出估算偏差；同时发现模型目录价格与官方价漂移（DeepSeek 高估 2.39×、Kimi 低估 3.99×），列为 v0.3 待办。上述两项已于 v0.4 修正（见 13.6）：目录价对齐官方价，缓存命中按 New API 转发的 `cached_tokens` 分档计价，流式/非流式实测费用与三段式公式逐位一致。v0.5 完成控制台 IA 升级与公开 API 脱敏（见 13.7），7 个路由 headless 复验通过、e2e 23/23；第 8 项子状态断言已由 `/healthz` 的 `checks[]` 支持并在概览页展示。v0.6 补齐第 6/8 项与运维验证（见 13.8）：`go test` 重放幂等 3 用例、`make limits` 9/9（maxIn=4、rpm=3）、`make persist` 8/8（重启后余额/账本/请求不变且可继续计费）、`make reconcile` 按日与 New API 对账并对孤立行点名。v0.7 落地价格版本化、审计、导出、keepalive、密钥配额与控制台状态统一（见 13.9），并新增 `make audit` 15/15 断言定价快照与两表 append-only；同日回归 e2e 23/23、limits 9/9、persist 8/8。
+验收状态（2026-10-29）：第 1–7、9、10 项已实测通过（见 13.4）；第 8 项仅验证了 `:18080` 控制面存活，未逐项断言 DB/New API/tokenizer 子状态；第 6 项的“重放不重复入账”由唯一键与 `ON CONFLICT DO NOTHING` 保证，但当时未做主动重放测试（v0.6 已补齐，见 13.8）。新增第 11 项“三方对账”已完成（见 13.5）：请求数、完成态 token、Kimi 逐条均与 Provider 一致，仅断流请求存在约 +17% 的输出估算偏差；同时发现模型目录价格与官方价漂移（DeepSeek 高估 2.39×、Kimi 低估 3.99×），列为 v0.3 待办。上述两项已于 v0.4 修正（见 13.6）：目录价对齐官方价，缓存命中按 New API 转发的 `cached_tokens` 分档计价，流式/非流式实测费用与三段式公式逐位一致。v0.5 完成控制台 IA 升级与公开 API 脱敏（见 13.7），7 个路由 headless 复验通过、e2e 23/23；第 8 项子状态断言已由 `/healthz` 的 `checks[]` 支持并在概览页展示。v0.6 补齐第 6/8 项与运维验证（见 13.8）：`go test` 重放幂等 3 用例、`make limits` 9/9（maxIn=4、rpm=3）、`make persist` 8/8（重启后余额/账本/请求不变且可继续计费）、`make reconcile` 按日与 New API 对账并对孤立行点名。v0.7 落地价格版本化、审计、导出、keepalive、密钥配额与控制台状态统一（见 13.9），并新增 `make audit` 15/15 断言定价快照与两表 append-only；同日回归 e2e 23/23、limits 9/9、persist 8/8。v0.8 收敛上游信任边界：New API 网关令牌按模型白名单限定，列表页错误态接入 `PageState` 重试分支（见 13.10），并补做 13.9 控制台改动的浏览器逐页点验。v0.9 落地“使用范围密钥与倍率”（见 13.11）：管理侧预置范围（模型白名单 + 0.1×–10× 倍率），用户建 Key 时下拉选择，网关按范围强制模型并在准入时快照倍率，倍率只作用于客户侧费用；用户侧与管理侧 Key/范围操作均加确认弹窗，回归 build/test/audit 15/15/e2e 23/23。Rust tokenizer 尚未接入：第 8 项的 tokenizer 子状态当前只覆盖 Go 启发式计数器，接入 sidecar 后需补制品哈希与降级断言（见 5.5）。
 
 ---
 
@@ -894,7 +928,7 @@ P0 全部满足：
 1. ~~**Kimi 与 DeepSeek 的 API Key**：请写入 `teemohub/.env`（不要发在聊天里），脚本只读取环境变量。~~ 已提供并写入 `.env`（0600），teemoHub 侧只持有 New API Token。
 2. ~~**可用模型名**：以你账号的 `/v1/models` 为准；若 Kimi 账号只有特定模型，请在 `.env` 指定。~~ 已确认为 `kimi-k3.1-pro`，`.env` 与模型目录已同步。
 3. **管理员用户名/密码**：默认 `admin`，密码由 `.env` 指定；首次启动后请修改。
-4. **是否允许本地下载官方 `tokenizer.json`**：若不允许，我改用近似 tokenizer，并在事件中标记降级。
+4. **官方 tokenizer 制品的获取方式**：v0.10 约定运行时只读本地文件、不联网下载；首次仍需你提供 DeepSeek/Kimi 的制品文件，或明确授权一次性下载并校验 SHA-256 落盘。Kimi 若只提供 tiktoken 编码，则改用 `tiktoken-rs`，不强行套用 HF `tokenizer.json`。
 5. ~~**开发价**：P0 使用配置价，仅用于本地演示；是否需要我按官方公开价初始化。~~ 已于 13.5 取得官方价：DeepSeek 输入 ¥1/M（命中 ¥0.02/M）、输出 ¥4/M；Kimi `kimi-k3.1-pro` 输入 ¥13/M（命中 ¥1.3/M）、输出 ¥68/M。v0.4 已写入模型目录并实现缓存命中计价（见 13.6）。
 
 ---
@@ -910,3 +944,6 @@ P0 全部满足：
 | v0.5 | 2026-10-30 | 参考 Prentis Console（只读）升级控制台：第 11 节 IA 改为四组导航并新增模型目录、用量分析、余额账单页；新增 13.7 公开 API 升级（模型面脱敏、analytics 毛利按权限隐藏、请求筛选 URL 同步、healthz 子检查、账本类型视图）；修复零数据用户 analytics `null` 崩溃与负数金额格式；headless Chrome 7 路由复验、e2e 23/23 |
 | v0.7 | 2026-10-30 | 新增 13.9：价格版本化（append-only `model_price_versions` + 请求快照 + 版本历史 UI）、审计日志页与同事务写审计、请求/账本 CSV 导出（BOM/注入防护）、SSE 15s keepalive、per-key TPM/并发/max_output 配额（429 + Retry-After）、`PageState` 统一三态与请求时间线；新增 `make audit`（15/15），并回归 e2e 23/23、limits 9/9、persist 8/8 |
 | v0.6 | 2026-10-30 | 新增 13.8 运维验证并接入 Makefile：`go test` 覆盖 Settle 重放幂等/零费用释放/未知请求；`make limits` 验证 4 路并发全部单次结算、第 5 路 429、槽位释放与 rpm=3 窗口限流；`make persist` 验证重启后余额/账本/请求不变且可继续计费；`make reconcile` 按日对齐 New API 消耗日志、逐条配对完成态、对断流行给估算带标注、对孤立行点名，支持 `--strict` 供 cron |
+| v0.8 | 2026-11-02 | 新增 13.10：`bootstrap-newapi.sh` 幂等把 `teemohub-gateway` 令牌限定到实际转发的三个模型（`/v1/models` 过滤、越界模型 403，网关未知模型仍先 400）；`KIMI_MODEL` 脚本默认值对齐 `kimi-k3.1-pro`；列表页（日志/模型目录/Keys/管理台用户、定价、审计）接入 `PageState` 的 error/onRetry，刷新失败保留旧数据并提示，浏览器实测停服→报错→重试恢复 |
+| v0.9 | 2026-11-02 | 新增 13.11 使用范围密钥与计费倍率：`key_scopes` 表与 `api_keys.scope_id`，管理侧配置模型白名单与基点倍率（0.1×–10×），用户建 Key 下拉选择；网关 403 `model_not_allowed`/`key_scope_disabled`/`key_scope_unavailable`，`/v1/models` 按范围过滤并折算价格；倍率仅作用于客户预留与结算，`requests` 准入快照 `scope_id`/`multiplier_bp`；范围被引用时禁止删除（409）；用户与管理侧的建 Key、撤销、范围保存/删除均加确认弹窗 |
+| v0.10 | 2026-11-10 | 校正 Rust tokenizer 落地约定：明确当前仍为 Go 启发式、Rust 未接入；默认改为 UDS sidecar（保持 `CGO_ENABLED=0`），cgo 绑定降为可选 build tag；补充 Kimi 制品格式待确认、失败降级与校准互斥、版本固定、金标回归与验收基线；`meter.Tokenizer` 抽出接口，便于替换 Rust 实现 |
